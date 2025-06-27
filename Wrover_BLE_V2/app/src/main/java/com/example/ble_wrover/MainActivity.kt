@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,6 +23,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
@@ -47,7 +49,13 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        bluetoothAdapter = bluetoothManager.adapter
+        val adapter = bluetoothManager.adapter
+        if (adapter == null) {
+            Toast.makeText(this, "Bluetooth not supported on this device", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
+        bluetoothAdapter = adapter
 
         setContent {
             BLE_WroverTheme {
@@ -167,21 +175,30 @@ fun BleScannerScreen(
         }
 
         try {
+            // Cancel any ongoing scan first
+            scanJob?.cancel()
+            bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
+
+            // Clear previous devices and reset selection
             devices.clear()
             selectedDevice = null
-            bluetoothAdapter.bluetoothLeScanner?.startScan(scanCallback)
-            scanJob?.cancel()
 
+            // Start scan
+            bluetoothAdapter.bluetoothLeScanner?.startScan(scanCallback)
+
+            // Schedule stopping scan after 20 seconds
             scanJob = CoroutineScope(Dispatchers.Main).launch {
-                delay(15 * 60 * 1000L)
+                delay(20 * 1000L)
                 bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
-                appendLog("Scan stopped after 15 minutes.")
+                appendLog("Scan stopped after 20 seconds.")
             }
+
             appendLog("Scan started...")
         } catch (e: SecurityException) {
             appendLog("Failed to start scan: ${e.message}")
         }
     }
+
 
     fun stopScan() {
         scanJob?.cancel()
@@ -239,7 +256,7 @@ fun BleScannerScreen(
         bluetoothGattState?.let { gatt ->
             appendLog("Disconnecting from device...")
 
-            // Disable notifications before disconnecting (optional, but recommended)
+            // Disable notifications before disconnecting (optional)
             for (service in gatt.services) {
                 for (characteristic in service.characteristics) {
                     if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
@@ -261,9 +278,19 @@ fun BleScannerScreen(
             }
 
             gatt.disconnect()
+            gatt.close()  // Close immediately to free resources
+
             appendLog("Disconnect requested.")
+            // Clear selection and connection state
+            selectedDevice = null
+            setGatt(null)
+            isConnected = false
+
+            // Optional: Restart scan immediately after disconnect
+            // startScan()
         } ?: appendLog("No device connected.")
     }
+
 
     BleScannerUI(
         devices = devices,
@@ -290,8 +317,8 @@ fun BleScannerUI(
     selectedDevice: String?,
     onDeviceSelected: (String) -> Unit,
     logLines: List<String>,
-    devicesListState: androidx.compose.foundation.lazy.LazyListState,
-    logListState: androidx.compose.foundation.lazy.LazyListState,
+    devicesListState: LazyListState,
+    logListState: LazyListState,
     onScanRequest: () -> Unit,
     onConnectClick: () -> Unit,
     onDisconnectClick: () -> Unit,
@@ -302,29 +329,22 @@ fun BleScannerUI(
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        Button(
-            onClick = onScanRequest,
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        Button(onClick = onScanRequest, modifier = Modifier.fillMaxWidth()) {
             Text("Scan for BLE Devices")
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            state = devicesListState
-        ) {
+        LazyColumn(modifier = Modifier.weight(1f), state = devicesListState) {
             items(devices) { device ->
                 val isSelected = device == selectedDevice
                 Text(
                     text = device,
-                    style = MaterialTheme.typography.bodyLarge.copy(fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal),
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 8.dp)
-                        .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent)
                         .clickable { onDeviceSelected(device) }
+                        .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.1f) else Color.Transparent)
                         .padding(8.dp)
                 )
                 HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
@@ -333,24 +353,20 @@ fun BleScannerUI(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text("Connection Log:", style = MaterialTheme.typography.titleMedium)
-        Divider(modifier = Modifier.padding(vertical = 4.dp))
-
+        Text("Connection Log:")
+        HorizontalDivider(Modifier, DividerDefaults.Thickness, DividerDefaults.color)
         LazyColumn(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(150.dp),
-            state = logListState,
-            reverseLayout = false
+            state = logListState
         ) {
-            items(logLines) { line ->
-                Text(line)
-            }
+            items(logLines) { line -> Text(line) }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = onConnectClick,
                 enabled = !isConnected,
@@ -358,7 +374,6 @@ fun BleScannerUI(
             ) {
                 Text("Connect")
             }
-
             Button(
                 onClick = onDisconnectClick,
                 enabled = isConnected,
@@ -378,6 +393,9 @@ class MyGattCallback(
     private val onDisconnected: () -> Unit
 ) : BluetoothGattCallback() {
 
+    private val buffer = StringBuilder()
+    private var flushJob: Job? = null
+
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
         runOnMainThread {
             when (newState) {
@@ -385,9 +403,14 @@ class MyGattCallback(
                     appendLog("Connected to $deviceInfo")
                     connectionStateChanged(newState)
                     if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                        gatt.discoverServices()
+                        // Request MTU before discovering services
+                        val mtuRequested = 100
+                        val mtuRequestSuccess = gatt.requestMtu(mtuRequested)
+                        appendLog("Requested MTU size $mtuRequested: $mtuRequestSuccess")
+                        // Discover services after MTU negotiation completes in onMtuChanged callback
+                        // If you want to discover services immediately (not recommended), call gatt.discoverServices() here.
                     } else {
-                        appendLog("Missing BLUETOOTH_CONNECT permission, cannot discover services")
+                        appendLog("Missing BLUETOOTH_CONNECT permission, cannot discover services or request MTU")
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -396,6 +419,20 @@ class MyGattCallback(
                     gatt.close()
                     onDisconnected()
                 }
+            }
+        }
+    }
+
+    override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+        runOnMainThread {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                appendLog("MTU changed to $mtu")
+            } else {
+                appendLog("MTU change failed with status $status")
+            }
+            // Now that MTU negotiation is done, start service discovery
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                gatt.discoverServices()
             }
         }
     }
@@ -439,12 +476,27 @@ class MyGattCallback(
     @Deprecated("Deprecated in Android 13")
     override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
         runOnMainThread {
-            val data = characteristic.value
-            val stringText = data?.let { String(it, Charsets.UTF_8) }
-                ?.filter { it.isLetterOrDigit() || it.isWhitespace() || it.isLetter() } ?: ""
-            appendLog("Notification from ${characteristic.uuid}: $stringText")
+            val data = characteristic.value ?: return@runOnMainThread
+            val chunk = String(data, Charsets.UTF_8)
+
+            // Append incoming chunk to buffer
+            buffer.append(chunk)
+
+            // Cancel previous flush job and start a new one with delay
+            flushJob?.cancel()
+            flushJob = CoroutineScope(Dispatchers.Main).launch {
+                delay(200) // wait 200 ms for more chunks before flushing
+
+                // Clean message: keep letters, digits, whitespace only (adjust filter as needed)
+                val message = buffer.toString().filter { it.isLetterOrDigit() || it.isWhitespace() }
+
+                appendLog("Received message: $message")
+
+                buffer.clear()
+            }
         }
     }
+
 
     override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
         runOnMainThread {
